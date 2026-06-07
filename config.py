@@ -12,13 +12,13 @@ import os
 class DataConfig:
     data_dir: str = ""
     img_size: int = 224
-    batch_size: int = 128
+    batch_size: int = 64
     num_workers: int = 8
     pin_memory: bool = True
     persistent_workers: bool = True
     prefetch_factor: int = 2
 
-    # split (7:2:1)
+    # split (7:1:2) — train:val:test = 70:10:20
     test_size: float = 0.3
     val_size_in_test: float = 1/3
 
@@ -31,15 +31,15 @@ class AblationConfig:
     use_convnext: bool = True
     use_mamba: bool = True
 
-    # 2.2 SAF
+    # 2.2 Structure-Aided Attention Fusion (SAF)
     use_saf: bool = True
     saf_prior: str = "edge"
     saf_dim: int = 256
     saf_fuse: str = "cat"
 
-    # 2.3 UGBF
-    use_ugbf: bool = True
-    ugbf_temperature: float = 1.0
+    # 2.3 Reliability-guided bilateral fusion (RGBF)
+    use_rgbf: bool = True
+    rgbf_temperature: float = 1.0
     detach_gate: bool = False
     gate_min: float = 0.05
 
@@ -87,6 +87,7 @@ class SchedulerConfig:
 class TrainConfig:
     epochs: int = 200
     gpus: int = 1
+    seed: int = 42
 
     amp: bool = True
     grad_accum_steps: int = 1
@@ -100,7 +101,7 @@ class TrainConfig:
     save_best_metric: str = "macro_f1"
     save_name: str = "best_model.pth"
     eval_every_epoch: bool = True
-    deterministic = True
+    deterministic: bool = True
 
 
 # =========================

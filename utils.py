@@ -43,7 +43,8 @@ def build_model_name(cfg):
         use_saf = getattr(dual_cfg, "use_saf", False)
         saf_prior = getattr(dual_cfg, "saf_prior", "none")
         saf_fuse = getattr(dual_cfg, "saf_fuse", "cat")
-        use_ugbf = getattr(dual_cfg, "use_ugbf", False)
+        use_rgbf = getattr(dual_cfg, "use_rgbf",
+                  getattr(dual_cfg, "use_ugbf", False))
 
         parts = [
             "Dual",
@@ -52,7 +53,7 @@ def build_model_name(cfg):
             f"SAF{use_saf}",
             f"prior{str(saf_prior)}",
             f"fuse{str(saf_fuse)}",
-            f"UGBF{use_ugbf}",
+            f"RGBF{use_rgbf}",
         ]
         return "_".join(parts)
 
@@ -78,7 +79,7 @@ def prepare_result_dirs(dataset_name, model_name):
 
     return dirs, log_file
 
-def calculate_auc(targets, scores, num_classes: int | None = None):
+def calculate_auc(targets, scores, num_classes=None):
     """
     Robust multiclass AUC (OvR), handles missing classes.
 
@@ -396,55 +397,26 @@ def plot_roc_curve(targets, scores, class_names, save_path=None, title=None, **k
     plt.close()
 
 
-def grad_cam(model, image, target_class):
-    model.eval()
-    output = model(image.unsqueeze(0))
-    model.zero_grad()
-    output[0, target_class].backward()
-
-    gradients = model.gradients['conv']
-    activations = model.activations['conv']
-
-    pooled_gradients = torch.mean(gradients, dim=[0, 2, 3])
-    weighted_activations = torch.zeros_like(activations)
-    for i in range(activations.shape[1]):
-        weighted_activations[:, i, :, :] = pooled_gradients[i] * activations[:, i, :, :]
-
-    heatmap = torch.mean(weighted_activations, dim=1).squeeze()
-    heatmap = F.relu(heatmap)
-    heatmap /= torch.max(heatmap)
-    return heatmap.detach().cpu().numpy()
+def grad_cam(*args, **kwargs):
+    """Deprecated. Use visualization/grad_cam.py instead (hook-based Grad-CAM)."""
+    raise NotImplementedError(
+        "utils.grad_cam is deprecated. "
+        "Please use visualization/grad_cam.py for hook-based Grad-CAM heatmap generation."
+    )
 
 
-def plot_feature_heatmaps(images, heatmaps,path='results/'):
+def plot_feature_heatmaps(images, heatmaps, path='results/'):
     """
+    Deprecated. Use visualization/grad_cam.py instead.
+
     :param images:  (B, C, H, W)
     :param heatmaps: [stage1, stage2, stage3]
     :param path:
     """
-    plt.figure(figsize=(15, 5))
-
-    # numpy
-    img_np = images.detach().cpu().permute(0, 2, 3, 1).numpy()
-    heatmaps = [h.detach().cpu().numpy() for h in heatmaps]
-
-    for i in range(min(3, images.shape[0])):
-        plt.subplot(3, 4, i * 4 + 1)
-        plt.imshow(img_np[i])
-        plt.title('Original')
-        plt.axis('off')
-
-        for stage in range(3):
-            plt.subplot(3, 4, i * 4 + stage + 2)
-            hm = heatmaps[stage][i].mean(0)
-            hm = (hm - hm.min()) / (hm.max() - hm.min())
-            plt.imshow(hm, cmap='viridis')
-            plt.title(f'Stage {stage + 1}')
-            plt.axis('off')
-
-    plt.tight_layout()
-    plt.savefig(path)
-    plt.close()
+    raise NotImplementedError(
+        "utils.plot_feature_heatmaps is deprecated. "
+        "Please use visualization/grad_cam.py instead."
+    )
 
 
 # def plot_learning_rates(history,dataset_name,model_name):

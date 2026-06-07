@@ -1,5 +1,6 @@
 # data_prepare.py
 import os
+import json
 import cv2
 import numpy as np
 import torch
@@ -75,12 +76,19 @@ def create_loaders(
     num_workers=4,
     test_size=0.3,
     val_size_in_test=1/3,
-    seed=42
+    seed=42,
+    split_file=None,
+    save_split=True,
 ):
     """
-      train_loader: (img, y)
-      val_loader  : (img, y)
-      test_loader : (img, y)
+    Create train/val/test DataLoaders with stratified image-level split.
+
+    If split_file is provided and exists, loads pre-saved split indices.
+    Otherwise creates a new stratified split and optionally saves it.
+
+    train_loader: (img, y)
+    val_loader  : (img, y)
+    test_loader : (img, y)
     """
     def get_random_resized_crop():
         try:
@@ -109,19 +117,47 @@ def create_loaders(
     # full dataset for stratified split
     full_dataset = MedicalDataset(data_dir, transform=None, two_view=False)
 
-    train_idx, temp_idx = train_test_split(
-        range(len(full_dataset)),
-        test_size=float(test_size),
-        stratify=full_dataset.labels,
-        random_state=int(seed)
-    )
+    # Try loading pre-saved split
+    if split_file is not None and os.path.exists(split_file):
+        with open(split_file, "r") as f:
+            split_data = json.load(f)
+        train_idx = split_data["train_idx"]
+        val_idx = split_data["val_idx"]
+        test_idx = split_data["test_idx"]
+    else:
+        train_idx, temp_idx = train_test_split(
+            range(len(full_dataset)),
+            test_size=float(test_size),
+            stratify=full_dataset.labels,
+            random_state=int(seed)
+        )
 
-    val_idx, test_idx = train_test_split(
-        temp_idx,
-        test_size=float(1.0 - val_size_in_test),
-        stratify=[full_dataset.labels[i] for i in temp_idx],
-        random_state=int(seed)
-    )
+        val_idx, test_idx = train_test_split(
+            temp_idx,
+            test_size=float(1.0 - val_size_in_test),
+            stratify=[full_dataset.labels[i] for i in temp_idx],
+            random_state=int(seed)
+        )
+
+        # Save split for reproducibility
+        if save_split and split_file is not None:
+            os.makedirs(os.path.dirname(split_file), exist_ok=True)
+            split_data = {
+                "train_idx": [int(i) for i in train_idx],
+                "val_idx": [int(i) for i in val_idx],
+                "test_idx": [int(i) for i in test_idx],
+                "train_paths": [full_dataset.file_paths[i] for i in train_idx],
+                "val_paths": [full_dataset.file_paths[i] for i in val_idx],
+                "test_paths": [full_dataset.file_paths[i] for i in test_idx],
+                "train_labels": [full_dataset.labels[i] for i in train_idx],
+                "val_labels": [full_dataset.labels[i] for i in val_idx],
+                "test_labels": [full_dataset.labels[i] for i in test_idx],
+                "class_names": full_dataset.class_names,
+                "seed": int(seed),
+                "dataset_dir": str(data_dir),
+            }
+            with open(split_file, "w") as f:
+                json.dump(split_data, f, indent=2)
 
     # train dataset
     train_dataset = MedicalDataset(

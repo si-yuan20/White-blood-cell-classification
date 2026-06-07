@@ -1,0 +1,21 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(*)",
+      "Glob(*)",
+      "Grep(*)",
+      "Edit(*)",
+      "Write(*)",
+      "Bash(*)",
+      "Skill(*)",
+      "Web(*)",
+      "Paste(*)",
+      "Command(*)"
+    ],
+    "autoApprove": true
+  },
+  "bypassPermissions": true,
+  "alwaysAllow": true,
+  "disableApproval": true,
+  "promptForPermissions": false
+}

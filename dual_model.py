@@ -21,9 +21,21 @@ from config import AblationConfig
 warnings.filterwarnings("ignore")
 
 
-class UGBFReliabilityGate(nn.Module):
+class ReliabilityGuidedBilateralFusionGate(nn.Module):
     """
-    Learnable reliability gate for dual-stream fusion.
+    Reliability-guided bilateral fusion gate.
+
+    Computes per-sample branch weights from confidence-derived reliability cues:
+      - predictive entropy (conv & mamba branches)
+      - maximum class probability (conv & mamba branches)
+      - classification margin = top1 - top2 (conv & mamba branches)
+
+    Additional embedding-level reliability cues (not treated as uncertainty estimates):
+      - embedding L2 norm (conv & mamba)
+      - cosine similarity between branch embeddings
+      - absolute entropy difference between branches
+
+    Output: alpha_conv, alpha_mamba with alpha_conv + alpha_mamba = 1 (softmax-normalized).
     """
     def __init__(self, in_dim: int = 10, hidden: int = 128, dropout: float = 0.1):
         super().__init__()
@@ -95,6 +107,10 @@ class UGBFReliabilityGate(nn.Module):
         w_c = w[:, 0].clamp(min=gate_min, max=1.0 - gate_min)
         w_m = (1.0 - w_c)
         return w_c, w_m
+
+
+# Legacy alias for backward compatibility (deprecated — use ReliabilityGuidedBilateralFusionGate)
+UGBFReliabilityGate = ReliabilityGuidedBilateralFusionGate
 
 
 # =========================================================
@@ -699,9 +715,14 @@ class DualConvNeXtMambaNet(nn.Module):
         self.num_classes = num_classes
         self.ab = ablation if ablation is not None else AblationConfig()
 
-        # 
+        #
         use_saf = bool(self.ab.use_saf and (self.ab.saf_prior != "none"))
-        use_ugbf = bool(self.ab.use_ugbf)
+        # Backward compat: support legacy use_ugbf field if present
+        _ab_use_rgbf = getattr(self.ab, "use_rgbf", None)
+        if _ab_use_rgbf is not None:
+            use_rgbf = bool(_ab_use_rgbf)
+        else:
+            use_rgbf = bool(getattr(self.ab, "use_ugbf", False))
 
         # ConvNeXt backbone
         self.convnext_backbone = _build_convnext_backbone(
@@ -725,10 +746,10 @@ class DualConvNeXtMambaNet(nn.Module):
         self.conv_dim = 1024
         self.mamba_dim = getattr(self.mamba_encoder, "embed_dim", mamba_embed_dim)
         self.saf_dim = getattr(self.ab, "saf_dim", 256)
-        self.ugbf_dim = 512
+        self.rgbf_dim = 512
 
-        # Branch heads (UGBF gate needs logits)
-        if use_ugbf:
+        # Branch heads (RGBF gate needs logits)
+        if use_rgbf:
             self.conv_branch_head = nn.Linear(self.conv_dim, num_classes)
             self.mamba_branch_head = nn.Linear(self.mamba_dim, num_classes)
         else:
@@ -761,44 +782,55 @@ class DualConvNeXtMambaNet(nn.Module):
             self.saf_classifier = None
 
         # =========================
-        # UGBF
+        # RGBF (reliability-guided bilateral fusion)
         # =========================
-        if use_ugbf:
-            self.conv_ugbf_proj_raw = nn.Linear(self.conv_dim, self.ugbf_dim)
-            self.mamba_ugbf_proj_raw = nn.Linear(self.mamba_dim, self.ugbf_dim)
+        if use_rgbf:
+            self.conv_rgbf_proj_raw = nn.Linear(self.conv_dim, self.rgbf_dim)
+            self.mamba_rgbf_proj_raw = nn.Linear(self.mamba_dim, self.rgbf_dim)
 
             if use_saf:
-                self.conv_ugbf_proj_saf = nn.Linear(self.saf_dim, self.ugbf_dim)
-                self.mamba_ugbf_proj_saf = nn.Linear(self.saf_dim, self.ugbf_dim)
+                self.conv_rgbf_proj_saf = nn.Linear(self.saf_dim, self.rgbf_dim)
+                self.mamba_rgbf_proj_saf = nn.Linear(self.saf_dim, self.rgbf_dim)
             else:
-                self.conv_ugbf_proj_saf = None
-                self.mamba_ugbf_proj_saf = None
+                self.conv_rgbf_proj_saf = None
+                self.mamba_rgbf_proj_saf = None
 
-            self.ugbf_fuse = nn.Sequential(
-                nn.LayerNorm(self.ugbf_dim),
-                nn.Linear(self.ugbf_dim, self.ugbf_dim),
+            self.rgbf_fuse = nn.Sequential(
+                nn.LayerNorm(self.rgbf_dim),
+                nn.Linear(self.rgbf_dim, self.rgbf_dim),
                 nn.GELU(),
             )
-            self.ugbf_classifier = nn.Linear(self.ugbf_dim, num_classes)
+            self.rgbf_classifier = nn.Linear(self.rgbf_dim, num_classes)
 
-            self.ugbf_temperature = getattr(self.ab, "ugbf_temperature", 1.0)
+            # Reliability-guided bilateral fusion gate (entropy + max_prob + margin)
+            self.reliability_gate = ReliabilityGuidedBilateralFusionGate(
+                in_dim=10, hidden=128, dropout=dropout
+            )
+            # Legacy alias (deprecated)
+            self.ugbf_gate_net = self.reliability_gate
+
+            self.rgbf_temperature = getattr(self.ab, "rgbf_temperature",
+                                  getattr(self.ab, "ugbf_temperature", 1.0))
             self.detach_gate = getattr(self.ab, "detach_gate", False)
             self.gate_min = getattr(self.ab, "gate_min", 0.05)
         else:
-            self.conv_ugbf_proj_raw = None
-            self.mamba_ugbf_proj_raw = None
-            self.conv_ugbf_proj_saf = None
-            self.mamba_ugbf_proj_saf = None
-            self.ugbf_fuse = None
-            self.ugbf_classifier = None
+            self.conv_rgbf_proj_raw = None
+            self.mamba_rgbf_proj_raw = None
+            self.conv_rgbf_proj_saf = None
+            self.mamba_rgbf_proj_saf = None
+            self.rgbf_fuse = None
+            self.rgbf_classifier = None
+            self.reliability_gate = None
+            self.ugbf_gate_net = None
 
-            self.ugbf_temperature = getattr(self.ab, "ugbf_temperature", 1.0)
+            self.rgbf_temperature = getattr(self.ab, "rgbf_temperature",
+                                  getattr(self.ab, "ugbf_temperature", 1.0))
             self.detach_gate = getattr(self.ab, "detach_gate", False)
             self.gate_min = getattr(self.ab, "gate_min", 0.05)
 
         # feature_dim
-        if use_ugbf:
-            self.feature_dim = self.ugbf_dim
+        if use_rgbf:
+            self.feature_dim = self.rgbf_dim
         elif use_saf:
             self.feature_dim = self.saf_dim
         else:
@@ -833,7 +865,7 @@ class DualConvNeXtMambaNet(nn.Module):
         att = (mag - mn) / (mx - mn + 1e-8)
         return att
 
-    def _ugbf_gate(
+    def _rgbf_gate(
             self,
             conv_logits: torch.Tensor,
             mamba_logits: torch.Tensor,
@@ -841,19 +873,25 @@ class DualConvNeXtMambaNet(nn.Module):
             mamba_emb_for_gate: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        UGBF: learnable reliability gate
-        返回: w_c, w_m  (B,)
+        RGBF: reliability-guided bilateral fusion gate.
+        Returns: w_c, w_m  (B,) with w_c + w_m = 1.
         """
-        w_c, w_m = self.ugbf_gate_net(
+        w_c, w_m = self.reliability_gate(
             conv_logits=conv_logits,
             mamba_logits=mamba_logits,
             conv_emb=conv_emb_for_gate,
             mamba_emb=mamba_emb_for_gate,
-            temperature=self.ugbf_temperature,
+            temperature=self.rgbf_temperature,
             detach_features=self.detach_gate,
             gate_min=self.gate_min,
         )
         return w_c, w_m
+
+    # Legacy alias (deprecated)
+    def _ugbf_gate(self, *args, **kwargs):
+        import warnings
+        warnings.warn("_ugbf_gate is deprecated. Use _rgbf_gate instead.", DeprecationWarning, stacklevel=2)
+        return self._rgbf_gate(*args, **kwargs)
 
     # -------------------- stream encoders --------------------
     def _conv_map(self, x: torch.Tensor) -> torch.Tensor:
@@ -884,7 +922,8 @@ class DualConvNeXtMambaNet(nn.Module):
     def _apply_ablation_trainability(self) -> None:
         use_c, use_m = self.ab.use_convnext, self.ab.use_mamba
         use_saf = bool(self.ab.use_saf and (self.ab.saf_prior != "none"))
-        use_ugbf = bool(self.ab.use_ugbf)
+        use_rgbf = bool(getattr(self.ab, "use_rgbf",
+                      getattr(self.ab, "use_ugbf", False)))
 
         def _set_trainable(mod, trainable: bool):
             if mod is None:
@@ -901,12 +940,12 @@ class DualConvNeXtMambaNet(nn.Module):
         _set_trainable(self.saf, False)
         _set_trainable(self.saf_classifier, False)
 
-        _set_trainable(self.conv_ugbf_proj_raw, False)
-        _set_trainable(self.mamba_ugbf_proj_raw, False)
-        _set_trainable(self.conv_ugbf_proj_saf, False)
-        _set_trainable(self.mamba_ugbf_proj_saf, False)
-        _set_trainable(self.ugbf_fuse, False)
-        _set_trainable(self.ugbf_classifier, False)
+        _set_trainable(self.conv_rgbf_proj_raw, False)
+        _set_trainable(self.mamba_rgbf_proj_raw, False)
+        _set_trainable(self.conv_rgbf_proj_saf, False)
+        _set_trainable(self.mamba_rgbf_proj_saf, False)
+        _set_trainable(self.rgbf_fuse, False)
+        _set_trainable(self.rgbf_classifier, False)
 
         if use_c and (not use_m):
             _set_trainable(self.mamba_encoder, False)
@@ -918,33 +957,33 @@ class DualConvNeXtMambaNet(nn.Module):
             _set_trainable(self.mamba_branch_head, True)
             return
 
-        if use_saf and use_ugbf:
+        if use_saf and use_rgbf:
             _set_trainable(self.saf, True)
             _set_trainable(self.conv_branch_head, True)
             _set_trainable(self.mamba_branch_head, True)
 
-            _set_trainable(self.conv_ugbf_proj_raw, True)
-            _set_trainable(self.mamba_ugbf_proj_raw, True)
-            _set_trainable(self.conv_ugbf_proj_saf, True)
-            _set_trainable(self.mamba_ugbf_proj_saf, True)
+            _set_trainable(self.conv_rgbf_proj_raw, True)
+            _set_trainable(self.mamba_rgbf_proj_raw, True)
+            _set_trainable(self.conv_rgbf_proj_saf, True)
+            _set_trainable(self.mamba_rgbf_proj_saf, True)
 
-            _set_trainable(self.ugbf_fuse, True)
-            _set_trainable(self.ugbf_classifier, True)
+            _set_trainable(self.rgbf_fuse, True)
+            _set_trainable(self.rgbf_classifier, True)
             return
 
-        if use_saf and (not use_ugbf):
+        if use_saf and (not use_rgbf):
             _set_trainable(self.saf, True)
             _set_trainable(self.saf_classifier, True)
             return
 
-        if (not use_saf) and use_ugbf:
+        if (not use_saf) and use_rgbf:
             _set_trainable(self.conv_branch_head, True)
             _set_trainable(self.mamba_branch_head, True)
 
-            _set_trainable(self.conv_ugbf_proj_raw, True)
-            _set_trainable(self.mamba_ugbf_proj_raw, True)
-            _set_trainable(self.ugbf_fuse, True)
-            _set_trainable(self.ugbf_classifier, True)
+            _set_trainable(self.conv_rgbf_proj_raw, True)
+            _set_trainable(self.mamba_rgbf_proj_raw, True)
+            _set_trainable(self.rgbf_fuse, True)
+            _set_trainable(self.rgbf_classifier, True)
             return
 
         # baseline concat
@@ -959,10 +998,22 @@ class DualConvNeXtMambaNet(nn.Module):
         logits, feat = self._forward_impl(x, return_feat=True)
         return feat
 
-    def _forward_impl(self, x: torch.Tensor, return_feat: bool = False):
+    def _forward_impl(self, x: torch.Tensor, return_feat: bool = False,
+                      return_aux: bool = False):
         use_c, use_m = self.ab.use_convnext, self.ab.use_mamba
         use_saf = bool(self.ab.use_saf and (self.ab.saf_prior != "none"))
-        use_ugbf = bool(self.ab.use_ugbf)
+        use_rgbf = bool(getattr(self.ab, "use_rgbf",
+                      getattr(self.ab, "use_ugbf", False)))
+        _w_c, _w_m = None, None  # for return_aux
+
+        def _pack(logits, feat=None):
+            if return_aux and return_feat:
+                return logits, feat, _w_c, _w_m
+            if return_aux:
+                return logits, _w_c, _w_m
+            if return_feat:
+                return logits, feat
+            return logits
 
         if (not use_c) and (not use_m):
             raise ValueError("Both streams are disabled.")
@@ -973,17 +1024,17 @@ class DualConvNeXtMambaNet(nn.Module):
             conv_emb = F.adaptive_avg_pool2d(conv_map, (1, 1)).flatten(1)
             if self.conv_branch_head is None:
                 raise RuntimeError(
-                    "conv_branch_head is None. Please enable use_ugbf or create conv head for single-stream.")
+                    "conv_branch_head is None. Please enable use_rgbf or create conv head for single-stream.")
             logits = self.conv_branch_head(conv_emb)
-            return (logits, conv_emb) if return_feat else logits
+            return _pack(logits, feat=conv_emb)
 
         if use_m and (not use_c):
             mamba_emb = self.mamba_encoder(x, return_tokens=False)
             if self.mamba_branch_head is None:
                 raise RuntimeError(
-                    "mamba_branch_head is None. Please enable use_ugbf or create mamba head for single-stream.")
+                    "mamba_branch_head is None. Please enable use_rgbf or create mamba head for single-stream.")
             logits = self.mamba_branch_head(mamba_emb)
-            return (logits, mamba_emb) if return_feat else logits
+            return _pack(logits, feat=mamba_emb)
 
         # -------- dual stream features --------
         conv_map = self._conv_map(x)
@@ -997,10 +1048,10 @@ class DualConvNeXtMambaNet(nn.Module):
         if mamba_map.device != conv_emb_raw.device:
             mamba_map = mamba_map.to(conv_emb_raw.device, non_blocking=True)
 
-        # UGBF gate
-        if use_ugbf:
+        # RGBF gate (reliability-guided bilateral fusion)
+        if use_rgbf:
             if self.conv_branch_head is None or self.mamba_branch_head is None:
-                raise RuntimeError("UGBF is enabled but branch heads are None (not constructed).")
+                raise RuntimeError("RGBF is enabled but branch heads are None (not constructed).")
             conv_logits_raw = self.conv_branch_head(conv_emb_raw)
             mamba_logits_raw = self.mamba_branch_head(mamba_emb_raw)
         else:
@@ -1014,45 +1065,45 @@ class DualConvNeXtMambaNet(nn.Module):
             edge_att = self._edge_attention_map(x)
             conv_saf_emb, mamba_saf_emb, fused_emb = self.saf(conv_map, mamba_map, edge_att)
 
-            if use_ugbf:
-                w_c, w_m = self._ugbf_gate(conv_logits_raw, mamba_logits_raw)
+            if use_rgbf:
+                _w_c, _w_m = self._rgbf_gate(conv_logits_raw, mamba_logits_raw)
 
-                if self.conv_ugbf_proj_saf is None or self.mamba_ugbf_proj_saf is None:
-                    raise RuntimeError("SAF+UGBF enabled but saf projections are None.")
+                if self.conv_rgbf_proj_saf is None or self.mamba_rgbf_proj_saf is None:
+                    raise RuntimeError("SAF+RGBF enabled but saf projections are None.")
 
-                c = self.conv_ugbf_proj_saf(F.normalize(conv_saf_emb, dim=1))
-                m = self.mamba_ugbf_proj_saf(F.normalize(mamba_saf_emb, dim=1))
+                c = self.conv_rgbf_proj_saf(F.normalize(conv_saf_emb, dim=1))
+                m = self.mamba_rgbf_proj_saf(F.normalize(mamba_saf_emb, dim=1))
 
-                fused = (w_c.unsqueeze(1) * c) + (w_m.unsqueeze(1) * m)
-                fused = self.ugbf_fuse(fused)
-                logits = self.ugbf_classifier(fused)
-                return (logits, fused) if return_feat else logits
+                fused = (_w_c.unsqueeze(1) * c) + (_w_m.unsqueeze(1) * m)
+                fused = self.rgbf_fuse(fused)
+                logits = self.rgbf_classifier(fused)
+                return _pack(logits, feat=fused)
 
             logits = self.saf_classifier(fused_emb)
-            return (logits, fused_emb) if return_feat else logits
+            return _pack(logits, feat=fused_emb)
 
         # -------- No SAF --------
-        if use_ugbf:
-            w_c, w_m = self._ugbf_gate(conv_logits_raw, mamba_logits_raw)
+        if use_rgbf:
+            _w_c, _w_m = self._rgbf_gate(conv_logits_raw, mamba_logits_raw)
 
-            if self.conv_ugbf_proj_raw is None or self.mamba_ugbf_proj_raw is None:
-                raise RuntimeError("UGBF enabled but raw projections are None.")
+            if self.conv_rgbf_proj_raw is None or self.mamba_rgbf_proj_raw is None:
+                raise RuntimeError("RGBF enabled but raw projections are None.")
 
-            c = self.conv_ugbf_proj_raw(F.normalize(conv_emb_raw, dim=1))
-            m = self.mamba_ugbf_proj_raw(F.normalize(mamba_emb_raw, dim=1))
+            c = self.conv_rgbf_proj_raw(F.normalize(conv_emb_raw, dim=1))
+            m = self.mamba_rgbf_proj_raw(F.normalize(mamba_emb_raw, dim=1))
 
-            fused = (w_c.unsqueeze(1) * c) + (w_m.unsqueeze(1) * m)
-            fused = self.ugbf_fuse(fused)
-            logits = self.ugbf_classifier(fused)
-            return (logits, fused) if return_feat else logits
+            fused = (_w_c.unsqueeze(1) * c) + (_w_m.unsqueeze(1) * m)
+            fused = self.rgbf_fuse(fused)
+            logits = self.rgbf_classifier(fused)
+            return _pack(logits, feat=fused)
 
         # baseline concat
         fused = self.fusion_mlp(torch.cat([conv_emb_raw, mamba_emb_raw], dim=1))
         logits = self.classifier(fused)
-        return (logits, fused) if return_feat else logits
+        return _pack(logits, feat=fused)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self._forward_impl(x, return_feat=False)
+    def forward(self, x: torch.Tensor, return_aux: bool = False):
+        return self._forward_impl(x, return_feat=False, return_aux=return_aux)
 
 
 # =========================================================
@@ -1081,6 +1132,7 @@ class MedicalImageClassifier(nn.Module):
         self.model_name = str(model_name).lower().strip()
         self.num_classes = num_classes
         self.pretrained = pretrained
+        self.model_type = self.model_name
 
         if self.model_name == "dual":
             self.model = DualConvNeXtMambaNet(
@@ -1096,28 +1148,32 @@ class MedicalImageClassifier(nn.Module):
                 dropout=dropout,
                 ablation=ablation,
             )
-        # elif self.model_name == "convnext":
-        #     self.model = ConvNeXtClassifier(
-        #         num_classes=num_classes,
-        #         convnext_name=convnext_name,
-        #         pretrained=pretrained,
-        #         in_channels=in_channels,
-        #         dropout=dropout,
-        #     )
-        # elif self.model_name == "mamba":
-        #     self.model = MambaClassifier(
-        #         num_classes=num_classes,
-        #         in_channels=in_channels,
-        #         img_size=mamba_img_size,
-        #         patch_size=mamba_patch_size,
-        #         embed_dim=mamba_embed_dim,
-        #         depth=mamba_depth,
-        #         dropout=dropout,
-        #     )
+        elif self.model_name == "convnext":
+            self.model = ConvNeXtNet(
+                num_classes=num_classes,
+                in_channels=in_channels,
+                backbone_name=convnext_name,
+                pretrained=pretrained,
+                dropout=dropout,
+            )
+        elif self.model_name == "mamba":
+            self.model = MambaNet(
+                num_classes=num_classes,
+                in_channels=in_channels,
+                img_size=mamba_img_size,
+                patch_size=mamba_patch_size,
+                embed_dim=mamba_embed_dim,
+                depth=mamba_depth,
+                dropout=dropout,
+            )
         else:
-            raise ValueError(f"Unknown model_name: {self.model_name}")
+            raise ValueError(f"Unknown model_name: {self.model_name}. Use convnext/mamba/dual.")
 
-    def forward(self, x):
+        self.feature_dim = getattr(self.model, "feature_dim", 512)
+
+    def forward(self, x, return_aux: bool = False):
+        if return_aux and hasattr(self.model, '_forward_impl'):
+            return self.model(x, return_aux=True)
         return self.model(x)
 
 
@@ -1152,8 +1208,17 @@ def create_classifier(model_name: str,
                       ablation: Optional[AblationConfig] = None,
                       **kwargs):
     """
-    Factory:
-      - convnext / mamba / dual
+    Factory for all model variants used in the paper.
+
+    Supported model_name values:
+      - convnext          : ConvNeXt-only baseline
+      - mamba             : Mamba-only baseline
+      - dual / dual_naive : ConvNeXt+Mamba naive concat (SAF off, RGBF off)
+      - dual_saf          : ConvNeXt+Mamba+SAF (RGBF off)
+      - dual_rgbf         : ConvNeXt+Mamba+RGBF (SAF off)
+      - dual_full / dual  : ConvNeXt+Mamba+SAF+RGBF (full framework)
+      - mobilevit         : MobileViT baseline (from timm)
+      - davit             : DaViT baseline (from timm)
     """
     model_name = str(model_name).lower().strip()
 
@@ -1172,94 +1237,263 @@ def create_classifier(model_name: str,
     in_channels = kwargs.pop("in_channels", 3)
     convnext_pretrained = kwargs.pop("convnext_pretrained", pretrained)
 
-    if model_name == "dual":
-        model = MedicalImageClassifier(
-            model_name="dual",
-            num_classes=num_classes,
-            pretrained=pretrained,
-            ablation=ablation,
-            convnext_name=convnext_name,
-            convnext_pretrained=convnext_pretrained,
-            in_channels=in_channels,
-            mamba_img_size=mamba_img_size,
-            mamba_patch_size=mamba_patch_size,
-            mamba_embed_dim=mamba_embed_dim,
-            mamba_depth=mamba_depth,
-            fusion_dim=fusion_dim,
-            dropout=dropout,
-        )
+    # --- dual variants via ablation config ---
+    def _ab(use_saf: bool, use_rgbf_flag: bool) -> AblationConfig:
+        return AblationConfig(
+            use_convnext=True,
+            use_mamba=True,
+            use_saf=use_saf,
+            saf_prior="edge" if use_saf else "none",
+            use_rgbf=use_rgbf_flag,
+        ) if ablation is None else ablation
+
+    if model_name in ("dual_full", "dual"):
+        if ablation is None:
+            ablation = _ab(use_saf=True, use_rgbf_flag=True)
+        model = _make_dual(num_classes, pretrained, ablation, convnext_name,
+                           convnext_pretrained, in_channels, mamba_img_size,
+                           mamba_patch_size, mamba_embed_dim, mamba_depth,
+                           fusion_dim, dropout)
         return model
 
+    if model_name == "dual_saf":
+        if ablation is None:
+            ablation = _ab(use_saf=True, use_rgbf_flag=False)
+        model = _make_dual(num_classes, pretrained, ablation, convnext_name,
+                           convnext_pretrained, in_channels, mamba_img_size,
+                           mamba_patch_size, mamba_embed_dim, mamba_depth,
+                           fusion_dim, dropout)
+        return model
+
+    if model_name == "dual_rgbf":
+        if ablation is None:
+            ablation = _ab(use_saf=False, use_rgbf_flag=True)
+        model = _make_dual(num_classes, pretrained, ablation, convnext_name,
+                           convnext_pretrained, in_channels, mamba_img_size,
+                           mamba_patch_size, mamba_embed_dim, mamba_depth,
+                           fusion_dim, dropout)
+        return model
+
+    if model_name == "dual_naive":
+        if ablation is None:
+            ablation = _ab(use_saf=False, use_rgbf_flag=False)
+        model = _make_dual(num_classes, pretrained, ablation, convnext_name,
+                           convnext_pretrained, in_channels, mamba_img_size,
+                           mamba_patch_size, mamba_embed_dim, mamba_depth,
+                           fusion_dim, dropout)
+        return model
+
+    # --- single-stream baselines ---
     if model_name == "convnext":
         model = MedicalImageClassifier(
-            model_name="convnext",
-            num_classes=num_classes,
-            pretrained=pretrained,
-            in_channels=in_channels,
-            convnext_name=convnext_name,
-            dropout=dropout,
+            model_name="convnext", num_classes=num_classes, pretrained=pretrained,
+            in_channels=in_channels, convnext_name=convnext_name, dropout=dropout,
         )
         return model
 
     if model_name == "mamba":
         model = MedicalImageClassifier(
-            model_name="mamba",
-            num_classes=num_classes,
-            pretrained=pretrained,
-            in_channels=in_channels,
-            mamba_img_size=mamba_img_size,
-            mamba_patch_size=mamba_patch_size,
-            mamba_embed_dim=mamba_embed_dim,
-            mamba_depth=mamba_depth,
-            dropout=dropout,
+            model_name="mamba", num_classes=num_classes, pretrained=pretrained,
+            in_channels=in_channels, mamba_img_size=mamba_img_size,
+            mamba_patch_size=mamba_patch_size, mamba_embed_dim=mamba_embed_dim,
+            mamba_depth=mamba_depth, dropout=dropout,
         )
         return model
 
-    raise ValueError(f"Unknown model_name: {model_name}. Use convnext/mamba/dual.")
+    # --- external baselines ---
+    if model_name in ("mobilevit", "davit"):
+        return _create_timm_baseline(model_name, num_classes, pretrained, dropout, **kwargs)
+
+    raise ValueError(f"Unknown model_name: {model_name}. "
+                     f"Use convnext/mamba/dual_naive/dual_saf/dual_rgbf/dual_full/mobilevit/davit.")
+
+
+def _make_dual(num_classes, pretrained, ablation, convnext_name,
+               convnext_pretrained, in_channels, mamba_img_size,
+               mamba_patch_size, mamba_embed_dim, mamba_depth,
+               fusion_dim, dropout):
+    return MedicalImageClassifier(
+        model_name="dual", num_classes=num_classes, pretrained=pretrained,
+        ablation=ablation, convnext_name=convnext_name,
+        convnext_pretrained=convnext_pretrained, in_channels=in_channels,
+        mamba_img_size=mamba_img_size, mamba_patch_size=mamba_patch_size,
+        mamba_embed_dim=mamba_embed_dim, mamba_depth=mamba_depth,
+        fusion_dim=fusion_dim, dropout=dropout,
+    )
+
+
+def _create_timm_baseline(model_name: str, num_classes: int, pretrained: bool,
+                          dropout: float, **kwargs):
+    """Create MobileViT or DaViT baseline via timm."""
+    import torch.nn as nn
+    try:
+        import timm
+    except ImportError:
+        raise ImportError("timm is required for MobileViT/DaViT baselines. "
+                          "Install with: pip install timm")
+
+    # Map model aliases to timm model names
+    timm_name_map = {
+        "mobilevit": ["mobilevit_xxs", "mobilevit_xs", "mobilevit_s"],
+        "davit": ["davit_tiny", "davit_small", "davit_base"],
+    }
+
+    candidates = timm_name_map.get(model_name, [model_name])
+    timm_model_name = None
+    for name in candidates:
+        try:
+            # Check if model is available in timm
+            _ = timm.create_model(name, pretrained=False, num_classes=num_classes)
+            timm_model_name = name
+            break
+        except Exception:
+            continue
+
+    if timm_model_name is None:
+        raise ValueError(
+            f"No {model_name} variant found in timm. "
+            f"Tried: {candidates}. Please check your timm version."
+        )
+
+    backbone = timm.create_model(
+        timm_model_name, pretrained=pretrained, num_classes=num_classes,
+        drop_rate=dropout,
+    )
+
+    class TimmWrapper(nn.Module):
+        def __init__(self, backbone, model_type, feat_dim=None):
+            super().__init__()
+            self.backbone = backbone
+            self.model_type = model_type
+            if feat_dim is not None:
+                self.feature_dim = feat_dim
+            elif hasattr(backbone, 'num_features'):
+                self.feature_dim = backbone.num_features
+            else:
+                self.feature_dim = 512
+
+        @torch.no_grad()
+        def forward_features(self, x):
+            if hasattr(self.backbone, 'forward_features'):
+                return self.backbone.forward_features(x)
+            if hasattr(self.backbone, 'forward_head'):
+                return self.backbone.forward_head(
+                    self.backbone.forward_features(x), pre_logits=True
+                )
+            return self.backbone(x)
+
+        def forward(self, x):
+            return self.backbone(x)
+
+    wrapper = TimmWrapper(backbone, model_type=model_name)
+
+    class OuterWrapper(nn.Module):
+        def __init__(self, wrapped):
+            super().__init__()
+            self.model = wrapped
+            self.model_name = model_name
+            self.feature_dim = wrapped.feature_dim
+            self.model_type = model_name
+
+        def forward(self, x):
+            return self.model(x)
+
+        def forward_features(self, x):
+            return self.model.forward_features(x)
+
+    return OuterWrapper(wrapper)
 
 
 # =========================================================
 # 8) Sanity tests
 # =========================================================
-def _run_one(model: nn.Module, x: torch.Tensor, name: str):
+def _run_one(model: nn.Module, x: torch.Tensor, name: str, return_aux: bool = False):
     model.eval()
     with torch.no_grad():
-        out = model(x)
-    print(f"{name:>18s} | out={tuple(out.shape)} | pred={torch.argmax(out, dim=1).cpu().tolist()}")
+        if return_aux and hasattr(model, "model") and hasattr(model.model, "_forward_impl"):
+            out = model(x, return_aux=True)
+        else:
+            out = model(x)
+    return out
 
 
 def test_all():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[Device] {device}")
-    dummy_input = torch.randn(4, 3, 224, 224).to(device)
+    print(f"[Torch] {torch.__version__}")
+    B, C, H, W = 2, 3, 224, 224
+    dummy_input = torch.randn(B, C, H, W).to(device)
 
-    m_conv = create_classifier("convnext", num_classes=5, pretrained=False).to(device)
-    m_mamba = create_classifier("mamba", num_classes=5, pretrained=False).to(device)
-    m_dual_base = create_classifier("dual", num_classes=5, pretrained=False, fusion_type="baseline").to(device)
+    variants = [
+        ("convnext", False),
+        ("mamba", False),
+        ("dual_naive", False),
+        ("dual_saf", False),
+        ("dual_rgbf", True),
+        ("dual_full", True),
+        ("mobilevit", False),
+        ("davit", False),
+    ]
 
-    print("\n== Original (kept) ==")
-    _run_one(m_conv, dummy_input, "convnext")
-    _run_one(m_mamba, dummy_input, "mamba")
-    _run_one(m_dual_base, dummy_input, "dual-baseline")
+    n_pass, n_skip, n_fail = 0, 0, 0
 
-    print("\n== Feature API check ==")
-    with torch.no_grad():
-        f = m_dual_base.forward_features(dummy_input)
-    print("dual-baseline forward_features:", tuple(f.shape), "feature_dim=", m_dual_base.feature_dim)
+    print(f"\n{'='*70}")
+    print(f"{'Model':<16} {'Shape':<16} {'Aux':<16} {'Status':<12}")
+    print(f"{'-'*70}")
 
-    ab_ac = AblationConfig(use_uaf=True, use_ms_convnext=True, use_ms_mamba=True, uaf_temperature=1.0)
-    m_dual_uaf_ms = create_classifier(
-        "dual", num_classes=5, pretrained=False,
-        fusion_type="uaf_ms", ablation=ab_ac
-    ).to(device)
-    with torch.no_grad():
-        f2 = m_dual_uaf_ms.forward_features(dummy_input)
-    print("dual-uaf_ms forward_features:", tuple(f2.shape), "feature_dim=", m_dual_uaf_ms.feature_dim)
+    for name, check_aux in variants:
+        try:
+            model = create_classifier(name, num_classes=5, pretrained=False).to(device)
+            out = _run_one(model, dummy_input, name, return_aux=check_aux)
 
-    info = m_dual_uaf_ms.get_model_info()
-    print(f"\n[Info] {info}")
+            if check_aux:
+                # Should return (logits, w_c, w_m)
+                if isinstance(out, tuple) and len(out) == 3:
+                    logits, w_c, w_m = out
+                    shape_ok = tuple(logits.shape) == (B, 5)
+                    alpha_sum_ok = torch.allclose(w_c + w_m, torch.ones_like(w_c), atol=1e-5)
+                    if shape_ok and alpha_sum_ok:
+                        print(f"{name:<16} {str(tuple(logits.shape)):<16} {'w_c+w_m≈1 ✓':<16} {'PASS':<12}")
+                        n_pass += 1
+                    else:
+                        print(f"{name:<16} {str(tuple(logits.shape)):<16} {'sum='+str((w_c+w_m)[:2].tolist()):<16} {'FAIL':<12}")
+                        n_fail += 1
+                else:
+                    logits = out[0] if isinstance(out, tuple) else out
+                    print(f"{name:<16} {str(tuple(logits.shape)):<16} {'unexpected aux':<16} {'FAIL':<12}")
+                    n_fail += 1
+            else:
+                shape_ok = tuple(out.shape) == (B, 5)
+                if shape_ok:
+                    print(f"{name:<16} {str(tuple(out.shape)):<16} {'-':<16} {'PASS':<12}")
+                    n_pass += 1
+                else:
+                    print(f"{name:<16} {str(tuple(out.shape)):<16} {'-':<16} {'FAIL':<12}")
+                    n_fail += 1
+
+            # Feature dim check
+            feat_dim = getattr(model, "feature_dim", None)
+            if feat_dim is not None:
+                print(f"  {'':>16} feature_dim={feat_dim}")
+
+        except ImportError as e:
+            print(f"{name:<16} {'SKIP':<16} {str(e)[:50]:<16} {'SKIP':<12}")
+            n_skip += 1
+        except Exception as e:
+            print(f"{name:<16} {'ERROR':<16} {str(e)[:50]:<16} {'FAIL':<12}")
+            n_fail += 1
+
+    print(f"{'='*70}")
+    print(f"Results: {n_pass} PASS, {n_skip} SKIP, {n_fail} FAIL")
+    print(f"{'='*70}")
+
+    return n_fail == 0
 
 
 if __name__ == "__main__":
-    test_all()
+    success = test_all()
+    if not success:
+        print("\n[WARN] Some model tests failed or were skipped. See details above.")
+    else:
+        print("\n[OK] All available model tests passed.")
 

@@ -27,7 +27,7 @@ from data_prepare import create_loaders
 from utils import MetricTracker, plot_confusion_matrix, plot_roc_curve, plot_learning_curves
 from dual_model import create_classifier
 from config import make_default_cfg, ensure_dirs, AblationConfig
-from utils import build_model_name, prepare_result_dirs,TopKRecorder,set_global_seed,get_dataset_name
+from utils import build_model_name, prepare_result_dirs, set_global_seed, get_dataset_name
 
 warnings.filterwarnings("ignore")
 
@@ -196,7 +196,8 @@ def build_model(cfg, num_classes: int, device: torch.device) -> nn.Module:
             print(f"[ConvNeXt] Loaded pretrained weights from {ckpt_path}")
             print(f"[ConvNeXt] Missing keys: {len(msg.missing_keys)}, Unexpected keys: {len(msg.unexpected_keys)}")
 
-    if model_name == "dual":
+    # Build ablation config for dual-stream variants
+    if model_name.startswith("dual"):
         ab = AblationConfig(
             use_convnext=cfg.model.dual.use_convnext,
             use_mamba=cfg.model.dual.use_mamba,
@@ -204,39 +205,36 @@ def build_model(cfg, num_classes: int, device: torch.device) -> nn.Module:
             saf_prior=cfg.model.dual.saf_prior,
             saf_dim=getattr(cfg.model.dual, "saf_dim", 256),
             saf_fuse=cfg.model.dual.saf_fuse,
-            use_ugbf=cfg.model.dual.use_ugbf,
-            ugbf_temperature=cfg.model.dual.ugbf_temperature,
+            use_rgbf=cfg.model.dual.use_rgbf,
+            rgbf_temperature=cfg.model.dual.rgbf_temperature,
             detach_gate=cfg.model.dual.detach_gate,
             gate_min=cfg.model.dual.gate_min,
         )
 
         model = create_classifier(
-            "dual",
+            model_name,
             num_classes=num_classes,
             pretrained=False,
-            ablation=ab
+            ablation=ab,
         )
 
         if cfg.model.pretrained:
-            _load_convnext_ckpt(model.model.convnext_backbone)
+            if hasattr(model, "model") and hasattr(model.model, "convnext_backbone"):
+                _load_convnext_ckpt(model.model.convnext_backbone)
 
         model = model.to(device)
         return model
 
-    if model_name == "convnext":
-        model = create_classifier("convnext", num_classes=num_classes, pretrained=False)
-        if cfg.model.pretrained:
-            if hasattr(model, "model") and hasattr(model.model, "backbone"):
-                _load_convnext_ckpt(model.model.backbone)
-        model = model.to(device)
-        return model
+    # Single-stream or external baselines
+    model = create_classifier(model_name, num_classes=num_classes,
+                              pretrained=cfg.model.pretrained)
 
-    if model_name == "mamba":
-        model = create_classifier("mamba", num_classes=num_classes, pretrained=cfg.model.pretrained)
-        model = model.to(device)
-        return model
+    if cfg.model.pretrained and model_name == "convnext":
+        if hasattr(model, "model") and hasattr(model.model, "backbone"):
+            _load_convnext_ckpt(model.model.backbone)
 
-    raise ValueError(f"Unknown model_name: {cfg.model.model_name}. Use convnext/mamba/dual.")
+    model = model.to(device)
+    return model
 
 def train_one_epoch(model, loader, criterion, optimizer, device, epoch, total_epochs):
     """
@@ -376,9 +374,13 @@ def parse_args():
     p.add_argument('--dual_saf_prior', type=str, default=None, choices=["edge", "none"])
     p.add_argument('--dual_saf_fuse', type=str, default=None, choices=["add", "cat"])
 
-    # 2.3 UGBF
-    p.add_argument('--dual_use_ugbf', action=argparse.BooleanOptionalAction, default=None)
-    p.add_argument('--dual_ugbf_temperature', type=float, default=None)
+    # 2.3 RGBF (reliability-guided bilateral fusion)
+    p.add_argument('--dual_use_rgbf', action=argparse.BooleanOptionalAction, default=None)
+    p.add_argument('--dual_use_ugbf', action=argparse.BooleanOptionalAction, default=None,
+                   help="(deprecated) use --dual_use_rgbf instead")
+    p.add_argument('--dual_rgbf_temperature', type=float, default=None)
+    p.add_argument('--dual_ugbf_temperature', type=float, default=None,
+                   help="(deprecated) use --dual_rgbf_temperature instead")
     p.add_argument('--dual_detach_gate', action=argparse.BooleanOptionalAction, default=None)
     p.add_argument('--dual_gate_min', type=float, default=None)
 
@@ -423,8 +425,11 @@ def apply_cli_to_cfg(cfg, args):
     cfg.model.dual.saf_prior = _merge(args.dual_saf_prior, cfg.model.dual.saf_prior)
     cfg.model.dual.saf_fuse = _merge(args.dual_saf_fuse, cfg.model.dual.saf_fuse)
 
-    cfg.model.dual.use_ugbf = _merge(args.dual_use_ugbf, cfg.model.dual.use_ugbf)
-    cfg.model.dual.ugbf_temperature = _merge(args.dual_ugbf_temperature, cfg.model.dual.ugbf_temperature)
+    # RGBF: prefer new arg name, fall back to legacy
+    _use_rgbf = args.dual_use_rgbf if args.dual_use_rgbf is not None else args.dual_use_ugbf
+    cfg.model.dual.use_rgbf = _merge(_use_rgbf, cfg.model.dual.use_rgbf)
+    _rgbf_T = args.dual_rgbf_temperature if args.dual_rgbf_temperature is not None else args.dual_ugbf_temperature
+    cfg.model.dual.rgbf_temperature = _merge(_rgbf_T, cfg.model.dual.rgbf_temperature)
     cfg.model.dual.detach_gate = _merge(args.dual_detach_gate, cfg.model.dual.detach_gate)
     cfg.model.dual.gate_min = _merge(args.dual_gate_min, cfg.model.dual.gate_min)
 
@@ -466,7 +471,7 @@ def _resolve_world_size(cfg) -> int:
 
 
 def _print_run_summary(console: Console, cfg, dataset_name: str, num_classes: int, world_size: int,
-                       per_gpu_batch: int, feat_dim: int | None):
+                       per_gpu_batch: int, feat_dim=None):
     console.title("RUN CONFIG")
     console.kv("Dataset", f"{dataset_name}  (classes={num_classes})")
     console.kv("Model", f"{cfg.model.model_name}  (pretrained={cfg.model.pretrained})")
@@ -480,8 +485,8 @@ def _print_run_summary(console: Console, cfg, dataset_name: str, num_classes: in
     if cfg.model.model_name.lower().strip() == "dual":
         console.kv("Dual.ConvNeXt", str(cfg.model.dual.use_convnext))
         console.kv("Dual.Mamba", str(cfg.model.dual.use_mamba))
-        console.kv("SAF(v2)", f"{cfg.model.dual.use_saf}  prior={cfg.model.dual.saf_prior}  fuse={cfg.model.dual.saf_fuse}")
-        console.kv("UGBF", f"{cfg.model.dual.use_ugbf}  T={cfg.model.dual.ugbf_temperature}")
+        console.kv("SAF", f"{cfg.model.dual.use_saf}  prior={cfg.model.dual.saf_prior}  fuse={cfg.model.dual.saf_fuse}")
+        console.kv("RGBF", f"{cfg.model.dual.use_rgbf}  T={cfg.model.dual.rgbf_temperature}")
 
     console.kv("Optimizer", f"{cfg.optim.optimizer}  lr={cfg.optim.lr}  wd={cfg.optim.weight_decay}")
     console.kv("Scheduler", f"{cfg.sched.name}  eta_min={cfg.sched.eta_min}")
@@ -511,6 +516,9 @@ def main_worker(rank: int, world_size: int, port: int, args_namespace):
 
         dataset_name = os.path.basename(os.path.normpath(cfg.data.data_dir))
 
+        # Split file for reproducible dataset splits
+        split_file = os.path.join("splits", f"{dataset_name}_seed{cfg.train.seed}.json")
+
         run_model_name = build_model_name(cfg)
 
         dirs, log_file = prepare_result_dirs(dataset_name, run_model_name)
@@ -532,7 +540,9 @@ def main_worker(rank: int, world_size: int, port: int, args_namespace):
             num_workers=cfg.data.num_workers,
             test_size=cfg.data.test_size,
             val_size_in_test=cfg.data.val_size_in_test,
-            seed=cfg.train.seed
+            seed=cfg.train.seed,
+            split_file=split_file,
+            save_split=True,
         )
 
 
